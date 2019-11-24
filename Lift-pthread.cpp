@@ -15,77 +15,54 @@
 #include <pthread.h>
 using namespace std;
 
-int get_int(char*& str, const char* eof){
-    int res = 0;
-    for(; str!=eof && (*str<'0' || *str>'9'); ++str);
+#define READ_DEBUG
+
+bool get_int(char*& str, const char* eof, int& res){
+    res = 0;
+    for(; str!=eof && (*str<'0' || *str>'9') && *str!='-'; ++str);
+    int k = 1; if (*str == '-'){++str; k=-1;}
+    if (*str<'0' || *str>'9') return false;
     for(; str!=eof && *str>='0' && *str<='9'; ++str) res = 10*res + *str - '0';
-    return res;
+    res*=k; return true;
 }
 typedef int Time_t;
-Time_t get_time(char*& str, const char* eof){
-    int h = get_int(str, eof), m = get_int(str, eof), s = get_int(str, eof);
-    return 3600*h + 60*m + s;
+const Time_t MAX_TIME = ~(1<<31);
+bool get_time(char*& str, const char* eof, Time_t& res){
+    int h, m, s; bool fl = get_int(str, eof, h) && get_int(str, eof, m) && get_int(str, eof, s);
+    res = 3600*h + 60*m + s; return fl;
 }
+enum {
+    UP, DOWN
+};
 class passenger{
     public:
-    int from, to;
+    int from, to, updown;
     Time_t when;
 };
-passenger get_passenger(char*& str, const char* eof){
-    passenger res;
-    res.when = get_time(str, eof); res.from = get_int(str, eof); res.to = get_int(str, eof);
-    return res;
+bool get_passenger(char*& str, const char* eof, passenger& res){
+    bool fl = get_time(str, eof, res.when) && get_int(str, eof, res.from) && get_int(str, eof, res.to);
+    res.updown = (res.to>res.from)?UP:DOWN;
+    return fl;
 }
-
 enum TYPES{
-    LIFT_SLEEP, PASSENGER, LIFT
+    PASSENGER, STAGE, LIFT, KILL_ME
 };
-
-class cond_var{
-    pthread_cond_t cond;
-    pthread_mutex_t *mut;
-    public:
-    cond_var(pthread_mutex_t *mutex){
-        mut = mutex;
-        pthread_cond_init(&cond, NULL);
-    }
-    ~cond_var(){
-        pthread_cond_destroy(&cond);
-    }
-    void wait(){
-        pthread_mutex_lock(mut);
-        pthread_cond_wait(&cond, mut);
-        pthread_mutex_unlock(mut);
-    }
-    void notify(){
-        pthread_mutex_lock(mut);
-        pthread_cond_signal(&cond);
-        pthread_mutex_unlock(mut);
-    }
-};
-
 class alarm_me{
     public:
-    cond_var* cond;
+    pthread_cond_t* cond;
     Time_t time;
     int type;
-    alarm_me(cond_var* condd, Time_t timee, int typee){cond = condd;time = timee;type = typee;}
-    bool operator < (alarm_me &b){
-        if (time<b.time) return true;
-        if (time>b.time) return false;
-        return type<b.type;
+    alarm_me(pthread_cond_t* condd, Time_t timee, int typee){cond = condd;time = timee;type = typee;}
+    friend bool operator < (const alarm_me &a, const alarm_me &b){//for priority_queue, it is > operator
+        if (a.time<b.time) return !true;
+        if (a.time>b.time) return !false;
+        return a.type>b.type;
     }
 };
-
-
 class stage{
     public:
     queue<int> q[2];//0 - up, 1 - down
 };
-
-
-
-
 class Building{
     public:
     int N = 0, K = 0, C = 0;
@@ -95,21 +72,28 @@ class Building{
     pthread_cond_t admin_cond;
     string file_name;
     pthread_t reader_tread;
-    vector<alarm_me> qu_time;
+    priority_queue<alarm_me> qu_time;
     vector<pthread_t> lifts;
+    vector<pthread_cond_t> lift_conds;
+    vector<int> lift_tasks;
+    queue<int> sleepy_lifts;
+    bool inited = false;
     Building(){
         pthread_mutex_init(&admin_mut, NULL);
         pthread_cond_init(&admin_cond, NULL);
     }
     ~Building(){
+        if (inited) for(int i=0; i<K; ++i) pthread_cond_destroy(&lift_conds[i]);
         pthread_cond_destroy(&admin_cond);
         pthread_mutex_destroy(&admin_mut);
     }
-    void init(char*& str, const char* eof){
-        N = get_int(str, eof); K = get_int(str, eof); C = get_int(str, eof);
-        T_stage = get_time(str, eof); T_open = get_time(str, eof); T_idle = get_time(str, eof);
-        T_close = get_time(str, eof); T_in = get_time(str, eof); T_out = get_time(str, eof);
-        stages.resize(N);lifts.resize(K);
+    bool init(char*& str, const char* eof){
+        if (!(get_int(str, eof, N) && get_int(str, eof, K) && get_int(str, eof, C) &&
+         get_time(str, eof, T_stage) && get_time(str, eof, T_open) && get_time(str, eof, T_idle) &&
+         get_time(str, eof, T_close) && get_time(str, eof, T_in) && get_time(str, eof, T_out))) return false;;
+        stages.resize(N+1);lifts.resize(K);lift_conds.resize(K);lift_tasks.resize(K);inited = true;
+        for(int i=0; i<K; ++i) pthread_cond_init(&lift_conds[i], NULL);
+        return true;;
     }
     void print(){
         printf("N = %d, K = %d, C = %d,\nT_stage = %d T_open = %d, T_idle = %d,\nT_close = %d, T_in = %d, T_out = %d\n", N, K, C, T_stage, T_open, T_idle, T_close, T_in, T_out);
@@ -126,17 +110,46 @@ void* file_reader(void* adr){
     pthread_cond_t local_cond;
     pthread_cond_init(&local_cond, NULL);
     pthread_mutex_lock(&B->admin_mut);
-    B->init(str, eof);
-    pthread_cond_signal(&B->admin_cond);
-    pthread_cond_wait(&local_cond, &B->admin_mut);
-
-
-
-
-
-    pthread_mutex_unlock(&B->admin_mut);
+    B->qu_time.push(alarm_me(&local_cond, MAX_TIME, KILL_ME));
+    if(!B->init(str, eof)){fprintf(stderr, "file_reader: init Building\n"); exit(0);}
+    #ifdef READ_DEBUG
+    B->print();
+    #endif
+    //Building is inited
+    passenger pg; bool fl = get_passenger(str, eof, pg);
+    for(;fl;fl = get_passenger(str, eof, pg)){
+        B->qu_time.push(alarm_me(&local_cond, pg.when, PASSENGER));
+        pthread_cond_signal(&B->admin_cond);
+        pthread_cond_wait(&local_cond, &B->admin_mut);
+        B->stages[pg.from].q[pg.updown].push(pg.to);
+    }
     munmap(mem, size);
     close(fd);
+    //join me
+    pthread_cond_signal(&B->admin_cond);
+    pthread_mutex_unlock(&B->admin_mut);
+    return NULL;
+}
+
+void* lift(void* adr){
+    Building* B = ((pair<Building*, int> *)adr)->first;
+    int th_number = ((pair<Building*, int> *)adr)->second;
+    pthread_mutex_lock(&B->admin_mut);
+    B->qu_time.push(alarm_me(&B->lift_conds[th_number], MAX_TIME, KILL_ME));
+    B->sleepy_lifts.push(th_number);
+    pthread_cond_signal(&B->admin_cond);
+    pthread_cond_wait(&B->lift_conds[th_number], &B->admin_mut);//wait for first task
+    for(;B->lift_tasks[th_number]!=0;){
+
+        //do
+        B->lift_tasks[th_number] = 0;
+        B->sleepy_lifts.push(th_number);
+        pthread_cond_signal(&B->admin_cond);
+        pthread_cond_wait(&B->lift_conds[th_number], &B->admin_mut);//wait for first task
+    }
+    //join me
+    pthread_cond_signal(&B->admin_cond);
+    pthread_mutex_unlock(&B->admin_mut);
     return NULL;
 }
 
@@ -146,10 +159,22 @@ void* time_admin(void* adr){
     B.file_name = *(string*)adr;
     pthread_mutex_lock(&B.admin_mut);
     pthread_create(&B.reader_tread, NULL, file_reader, &B);
-    pthread_cond_wait(&B.admin_cond, &B.admin_mut);
-    
+    pthread_cond_wait(&B.admin_cond, &B.admin_mut);//Building is inited
+    for (int i=0; i<B.K; ++i){
+        pair<Building*, int> var = pair<Building*, int>(&B, i);
+        pthread_create(&B.reader_tread, NULL, lift, &var);
+        pthread_cond_wait(&B.admin_cond, &B.admin_mut);
+    }
+    for(;!B.qu_time.empty();){
+        alarm_me alm = B.qu_time.top();B.qu_time.pop();
+        pthread_cond_signal(alm.cond);
+        pthread_cond_wait(&B.admin_cond, &B.admin_mut);
+    }
+
+
     pthread_mutex_unlock(&B.admin_mut);
-    B.print();
+    pthread_join(B.reader_tread, NULL);
+    for (int i=0; i<B.K; ++i) pthread_join(B.lifts[i], NULL);
     return NULL;
 }
 
