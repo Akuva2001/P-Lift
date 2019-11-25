@@ -22,15 +22,17 @@ class passenger{
 };
 
 int main(){
+    int n;
+    int max_time1 = 60;
+    cout<<"Passengers:";
+    cin>>n;cout<<"Time:";
+    cin>>max_time1;
     int fd;
     if ((fd = open("input.txt", O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))<0)
             perror("open");
     dup2(fd, 1);
     int N = 10, K = 4, C = 7;
     printf("10 4 7\n0:0:3 0:0:2 0:1:0 0:0:2 0:0:3 0:0:3\n");
-    int n;
-    int max_time1 = 60;
-    cin>>n>>max_time1;
     vector<int> p(n);
     for(int i=0; i<n; ++i){
         p[i] = rand()%max_time1;
