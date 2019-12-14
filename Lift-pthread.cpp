@@ -15,7 +15,6 @@
 #include <pthread.h>
 using namespace std;
 
-#define READ_DEBUG
 #define DEBUG
 
 bool get_int(char*& str, const char* eof, int& res){
@@ -195,7 +194,7 @@ class Building{
         pthread_cond_wait(&admin_cond, &admin_mut);//Building is inited
         if(!inited) {pthread_join(reader.thr, NULL);fprintf(stderr, "%d\tBuilding not inited (Building::run()\n", World_time);return;}
         else{
-            #ifdef READ_DEBUG
+            #ifdef DEBUG
             print();
             #endif
         }
@@ -204,7 +203,9 @@ class Building{
             pthread_cond_wait(&admin_cond, &admin_mut);
         }//Lifts is inited
         for(;!qu_time.empty();){
+            #ifdef DEBUG
             print_qu_time();
+            #endif
             alarm_class alm = qu_time.top();qu_time.pop();
             World_time = alm.time;
             if (alm.act != NULL){//*alm.act == NOT_ALARM_ME){
@@ -256,8 +257,8 @@ void stage_class::check(int updown){
     if (bottom[updown] == PUSHED) return;
     #ifdef DEBUG
     printf("%d\tI'm stage_class::check(), need to push the button\n", B->World_time);
-    bottom[updown] = PUSHED;
     #endif
+    bottom[updown] = PUSHED;
     if(!B->sleepy_lifts.empty()){
         vector<pair<int,int>>::iterator acc = B->sleepy_lifts.begin();
         int du = abs(acc->first-num);
@@ -290,18 +291,8 @@ void reader_class::run(){
     int size = stat_buf.st_size; void* mem = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
     if (mem==NULL) {perror("reader_fun: mmap"); exit(0);}
     str = (char *) mem; eof = str+size;
-    #ifdef DEBUG
-    printf("%d\tI'm reader_class::run(). point #1 still alive\n", B->World_time);
-    #endif
     pthread_mutex_lock(&B->admin_mut);
-    #ifdef DEBUG
-    //perror("after mut_lock");
-    printf("%d\tI'm reader_class::run(). point #2 still alive\n", B->World_time);
-    #endif
     if(!B->init(str, eof)){printf("%d\treader_fun: init Building error\n", B->World_time); exit(0);}
-    #ifdef DEBUG
-    B->print();
-    #endif
     //Building is inited
     passenger_class pg; bool fl = get_passenger_class(str, eof, pg);
     for(;fl;fl = get_passenger_class(str, eof, pg)){
@@ -427,7 +418,7 @@ void lift_class::sleep(){
 }
 void lift_class::run(){
     #ifdef DEBUG
-    fprintf(stderr, "%d\tI'm lift_class::run()\n", B->World_time);
+    printf("%d\tI'm lift_class::run()\n", B->World_time);
     #endif
     pthread_mutex_lock(&B->admin_mut);
     B->qu_time.push(alarm_class(&cond, MAX_TIME, KILL_ME, number, number));
@@ -495,8 +486,11 @@ void* lift_fun(void* adr){
 
 int main(){
     //printf(Color_CYAN);
+    int fd = open("output.txt", O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    dup2(fd, 1);close(fd);
     Building B; B.reader.filename = string("input.txt");
     B.run();
     B.print_stats();
+    close(1);
     return 0;
 }
