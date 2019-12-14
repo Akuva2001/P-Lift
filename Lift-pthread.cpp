@@ -27,7 +27,8 @@ bool get_int(char*& str, const char* eof, int& res){
     res*=k; return true;
 }
 typedef int Time_t;
-const Time_t MAX_TIME = ~(1<<31);
+const Time_t MAX_TIME = (~(1<<31))/2;
+const int MAXINT = (~(1<<31))/2;
 bool get_time(char*& str, const char* eof, Time_t& res){
     int h, m, s; bool fl = get_int(str, eof, h) && get_int(str, eof, m) && get_int(str, eof, s);
     res = 3600*h + 60*m + s; return fl;
@@ -80,6 +81,7 @@ class stage_class{
     queue<passenger_class> q[2];//0 - up, 1 - down
     int bottom[2] = {NOT_PUSHED, NOT_PUSHED};
     void push(passenger_class pg);
+    void check(int updown);
 };
 enum{
     WAIT, DOORS_OPENED, DOORS_CLOSED, PASSENGERS_EXCHANGE, SLEEP, LIFT_ERR, NOT_STARTED
@@ -87,12 +89,12 @@ enum{
 class lift_class{
     public:
     Building* B;
-    int number, my_stage = 1, updown = UP, task = 0;
+    int count = 0, my_stage = 1, updown = UP, task = 0;
     vector<queue<passenger_class>> passengers;
     pthread_t thr;
     pthread_cond_t cond;
     int state = NOT_STARTED;
-    //int number = 0;
+    int number;
     lift_class(){pthread_cond_init(&cond, NULL);}
     ~lift_class(){pthread_cond_destroy(&cond);}
     void alarm(Time_t when);
@@ -119,7 +121,7 @@ class reader_class{
     void run();
 };
 enum{
-    PUSHER = -1, READER = -2, ERR = -3
+    PUSHER = -1, READER = -2, ERR = -3, CHECKER = -4
 };
 void* reader_fun(void* adr);
 void* lift_fun(void* adr);
@@ -131,22 +133,39 @@ class Building{
     pthread_mutex_t admin_mut;
     pthread_cond_t admin_cond;
     priority_queue<alarm_class> qu_time;
-    set<pair<int, int>> sleepy_lifts;//stage_class, thread_number
-    set<pair<int, int>> requests;//stage_class, updown
+    vector<pair<int, int>> sleepy_lifts;//stage, lift_number
+    deque<pair<int, int>> requests;//stage, updown
     Time_t World_time = 0;
     reader_class reader;
     vector<lift_class> lifts;
     vector<passenger_class> accepted_passengers;
     bool inited = false;
+    void print_stats(){
+        double T_All=0, T_Wait=0, T_Inside=0, Stages = 0;
+        for (const auto & it : accepted_passengers){
+            T_All+=it.come_out - it.come;
+            T_Wait+=it.come_in-it.come;
+            T_Inside+=it.come_out-it.come_in;
+            Stages+=abs(it.to-it.from);
+        }
+        T_All/=accepted_passengers.size(); T_Wait/=accepted_passengers.size(); T_Inside/=accepted_passengers.size(); Stages/=accepted_passengers.size();
+        printf("\n%ld passengers\nAverage numbers:\nT = %g s\nT_wait = %g s\nT_inside = %g s\nStages = %g\n", accepted_passengers.size(), T_All, T_Wait, T_Inside, Stages);
+    }
     void print_qu_time(){
         FILE* out = fopen("qu_out.txt", "at");
         priority_queue<alarm_class> qu_copy = qu_time;
-        fprintf(out,"\n");
+        fprintf(out,"\nsleep\t");
+        for(auto it : sleepy_lifts){
+            fprintf(out, "(%d, %d)\t", it.first, it.second);
+        }fprintf(out, "\nreq\t");
+        for(auto it : requests){
+            fprintf(out, "(%d, %d)\t", it.first, it.second);
+        }fprintf(out, "\n");
         for(;!qu_copy.empty();){
             alarm_class alm = qu_copy.top();qu_copy.pop();
-            fprintf(out, "%10d \t%-9s \t%s \t%s \t%s\n", alm.time, (alm.type == PASSENGER)?"PASSENGER":(alm.type==LIFT)?"LIFT":"KILL_LIFT", 
-                (alm.sender==PUSHER)?"PUSHER":(alm.sender==READER)?"READER":(string("LIFT ")+to_string(alm.sender)).c_str(),
-                (alm.num   ==PUSHER)?"PUSHER":(alm.num   ==READER)?"READER":(string("LIFT ")+to_string(alm.num   )).c_str(),
+            fprintf(out, "%10d \t%-9s \t%-7s\t%s \t%s\n", alm.time, (alm.type == PASSENGER)?"PASSENGER":(alm.type==LIFT)?"LIFT":"KILL_LIFT", 
+                (alm.sender==PUSHER)?"PUSHER":(alm.sender==CHECKER)?"CHECKER":(alm.sender==READER)?"READER":(string("LIFT ")+to_string(alm.sender)).c_str(),
+                (alm.num   ==PUSHER)?"PUSHER":(alm.num   ==CHECKER)?"CHECKER":(alm.num   ==READER)?"READER":(string("LIFT ")+to_string(alm.num   )).c_str(),
                 (alm.act==NULL)?"NULL":(*(alm.act)==ALARM_ME)?"ALARM_ME":"NOT_ALARM_ME");
         }
         fclose(out);
@@ -165,7 +184,7 @@ class Building{
          get_time(str, eof, T_stage) && get_time(str, eof, T_open) && get_time(str, eof, T_idle) &&
          get_time(str, eof, T_close) && get_time(str, eof, T_in) && get_time(str, eof, T_out))) return false;;
         stages.resize(N+1);lifts.resize(K);inited = true;
-        for(int i=0; i<K; ++i) {lifts[i].passengers.resize(N+1);lifts[i].B = this;}
+        for(int i=0; i<K; ++i) {lifts[i].passengers.resize(N+1);lifts[i].B = this;lifts[i].number = i;}
         for(int i=0; i<=N; ++i) {stages[i].B = this; stages[i].num = i;}
         FILE* out = fopen("qu_out.txt", "w"); fclose(out);
         return true;
@@ -181,7 +200,6 @@ class Building{
             #endif
         }
         for (int i=0; i<K; ++i){
-            lifts[i].number = i;
             pthread_create(&lifts[i].thr, NULL, lift_fun, &lifts[i]);
             pthread_cond_wait(&admin_cond, &admin_mut);
         }//Lifts is inited
@@ -231,31 +249,35 @@ void stage_class::push(passenger_class pg){
     pg.print();
     #endif
     if (bottom[pg.updown] == PUSHED) return;
+    check(pg.updown);return;
+}
+void stage_class::check(int updown){
+    if (updown!=UP && updown!=DOWN) {fprintf(stderr, "%d\tI'm stage_class::check(), wrong request\n", B->World_time); return;}
+    if (bottom[updown] == PUSHED) return;
     #ifdef DEBUG
-    printf("%d\tI'm stage_class::push(), need to push the button\n", B->World_time);
-    bottom[pg.updown] = PUSHED;
+    printf("%d\tI'm stage_class::check(), need to push the button\n", B->World_time);
+    bottom[updown] = PUSHED;
     #endif
     if(!B->sleepy_lifts.empty()){
-        auto lb = B->sleepy_lifts.lower_bound(pair<int,int>(pg.from, 0));
-        auto ub = B->sleepy_lifts.upper_bound(pair<int,int>(pg.from, 0));
-        set<pair<int,int>>::iterator acc;
-        if(lb==B->sleepy_lifts.end()) acc = ub;//map is not empty, so one of them exists for sure 
-        else{
-            int dl = abs(lb->first-pg.from), du = abs(ub->first-pg.from);
-            if(dl<du) acc = lb; else if (dl>du) acc = ub;
-            else{if (pg.updown == UP) acc = lb; else acc = ub;}
+        vector<pair<int,int>>::iterator acc = B->sleepy_lifts.begin();
+        int du = abs(acc->first-num);
+        for(int i=1; i<B->sleepy_lifts.size();++i){
+            auto it = B->sleepy_lifts.begin()+i;
+            int dl = abs(it->first-num);
+            if(dl<du) acc = it; else if (dl>du) continue;
+            else if (updown == UP) acc = it;
         }
-        B->lifts[acc->second].task = pg.from;
-        B->lifts[acc->second].updown = pg.updown;
-        B->qu_time.push(alarm_class(&B->lifts[acc->second].cond, pg.come, LIFT, PUSHER, acc->second));
+        B->lifts[acc->second].task = num;
+        B->lifts[acc->second].updown = updown;
+        B->qu_time.push(alarm_class(&B->lifts[acc->second].cond, B->World_time, LIFT, CHECKER, acc->second));
         #ifdef DEBUG
-        printf("%d\tI'm stage_class::push(), woke lift number %d\n", B->World_time, acc->second);
+        printf("%d\tI'm stage_class::check(), woke lift %d stage %d\n", B->World_time, acc->second, acc->first);
         #endif
-        B->sleepy_lifts.erase(*acc);
+        B->sleepy_lifts.erase(acc);
     } else {
-        B->requests.insert(pair<int,int>(pg.from, pg.updown));
+        B->requests.push_back(pair<int,int>(num, updown));
         #ifdef DEBUG
-        printf("%d\tI'm stage_class::push(), made a request: stage %d, %s\n", B->World_time, pg.from, (pg.updown==UP)?"UP":"DOWN");
+        printf("%d\tI'm stage_class::check(), made a request: stage %d, %s\n", B->World_time, num, (updown==UP)?"UP":"DOWN");
         #endif
     }
 }
@@ -285,7 +307,7 @@ void reader_class::run(){
     for(;fl;fl = get_passenger_class(str, eof, pg)){
         ++pg.number;
         #ifdef DEBUG
-        printf("%d\tI'm reader_class::run(), get this:", B->World_time);
+        printf("%d\tI'm reader_class::run(), get this: ", B->World_time);
         pg.print();
         #endif
         B->qu_time.push(alarm_class(&cond, pg.come, PASSENGER, READER));
@@ -302,7 +324,7 @@ void reader_class::run(){
     pthread_cond_signal(&B->admin_cond);
     pthread_cond_destroy(&cond);
     #ifdef DEBUG
-    printf("%d\tI'm reader_class::run(), I'dying with smile\n", B->World_time);
+    printf("%d\tI'm reader_class::run(), I'm dying with smile\n", B->World_time);
     #endif
     pthread_mutex_unlock(&B->admin_mut);
 }
@@ -321,12 +343,12 @@ void lift_class::open_doors(){
 void lift_class::close_doors(){
     if (state == DOORS_CLOSED || state == SLEEP) {state = DOORS_CLOSED;return;}
     if (state == DOORS_OPENED || state == WAIT){alarm(B->World_time+B->T_close); state = DOORS_CLOSED; return;}
-    state = LIFT_ERR; fprintf(stderr, "close_doors_err\n");
+    state = LIFT_ERR; fprintf(stderr, "close_doors_err\n");B->stages[number].check(updown);
 }
 void lift_class::get_out_passengers(){
     if (state!=DOORS_OPENED){state = LIFT_ERR; fprintf(stderr, "get_out_passengers_err\n");return;}
     for(;!passengers[my_stage].empty();){
-        passenger_class pg = passengers[my_stage].front();passengers[my_stage].pop();--number;
+        passenger_class pg = passengers[my_stage].front();passengers[my_stage].pop();--count;
         pg.come_out = B->World_time; B->accepted_passengers.push_back(pg);alarm(B->World_time+B->T_out);
         #ifdef DEBUG
         printf("%d\tI'm lift %d ::get_out_passengers() I get_out pg on stage %d ", B->World_time, number, my_stage);
@@ -336,9 +358,9 @@ void lift_class::get_out_passengers(){
 }
 void lift_class::get_passengers(){
     if (state!=DOORS_OPENED){state = LIFT_ERR; fprintf(stderr, "get_passengers_err\n");return;}
-    for (;number<B->C && !B->stages[my_stage].q[updown].empty();){
+    for (;count<B->C && !B->stages[my_stage].q[updown].empty();){
         passenger_class pg = B->stages[my_stage].q[updown].front();B->stages[my_stage].q[updown].pop();
-        pg.come_in = B->World_time + B->T_in;passengers[pg.to].push(pg);++number;
+        pg.come_in = B->World_time + B->T_in;passengers[pg.to].push(pg);++count;
         #ifdef DEBUG
         printf("%d\tI'm lift %d ::get_passengers() I get pg on stage %d ", B->World_time, number, my_stage);
         pg.print();
@@ -354,7 +376,7 @@ void lift_class::go_to_stage_by_steps(){
     close_doors();int dt=(my_stage>task)?-1:1;
     for(;my_stage+dt!=task;){
         my_stage+=dt; alarm(B->World_time+B->T_stage);
-        if(!passengers[my_stage].empty() || (!B->stages[my_stage].q[updown].empty() && number<B->C)){open_doors();get_out_passengers(); get_passengers();close_doors();}
+        if(!passengers[my_stage].empty() || (!B->stages[my_stage].q[updown].empty() && count<B->C)){open_doors();get_out_passengers(); get_passengers();close_doors();}
     }
     my_stage+=dt; alarm(B->World_time+B->T_stage);
 }
@@ -371,17 +393,17 @@ void lift_class::end(){
     #endif
     int dt = (updown == UP)?1:-1;
     open_doors();get_out_passengers(); get_passengers();
-    for (;number!=0;){
+    for (;count!=0;){
         close_doors();
         my_stage+=dt; alarm(B->World_time+B->T_stage);
-        if(!passengers[my_stage].empty() || (!B->stages[my_stage].q[updown].empty() && number<B->C)){open_doors();get_out_passengers(); get_passengers();}
+        if(!passengers[my_stage].empty() || (!B->stages[my_stage].q[updown].empty() && count<B->C)){open_doors();get_out_passengers(); get_passengers();}
     }
     state = WAIT;
 }
 void lift_class::sleep(){
     //wait();
     state = WAIT; task = 0;int* p = new int; *p = ALARM_ME;
-    B->sleepy_lifts.insert(pair<int,int>(my_stage, number));
+    B->sleepy_lifts.push_back(pair<int,int>(my_stage, number));
     #ifdef DEBUG
     printf("%d\tI'm lift %d ::sleep() I'm on %d and wait with open doors\n", B->World_time, number, my_stage);
     #endif
@@ -410,7 +432,7 @@ void lift_class::run(){
     pthread_mutex_lock(&B->admin_mut);
     B->qu_time.push(alarm_class(&cond, MAX_TIME, KILL_ME, number, number));
     state = SLEEP;
-    B->sleepy_lifts.insert(pair<int,int>(my_stage, number));
+    B->sleepy_lifts.push_back(pair<int,int>(my_stage, number));
     #ifdef DEBUG
     printf("%d\tI'm lift %d ::run() ready to start and go sleep\n", B->World_time, number);
     #endif
@@ -428,23 +450,23 @@ void lift_class::run(){
         #endif
         //get new task
         task = 0;
-        for(;!B->requests.empty();){//requests: stage, updown
-            set<pair<int,int>>::iterator acc, lb, ub;
-            lb = B->requests.lower_bound(pair<int,int>(my_stage, 0));
-            ub = B->requests.upper_bound(pair<int,int>(my_stage, 0));
-            if(lb==B->requests.end()) acc = ub;//map is not empty, so one of them exists for sure 
-            else{
-                int dl = abs(lb->first-my_stage), du = abs(ub->first-my_stage);
-                if(dl<du) acc = lb; else if (dl>du) acc = ub;
-                else{if (ub->second == UP) acc = ub; else acc = lb;}
+        for(;!B->requests.empty() && B->stages[B->requests[0].first].bottom[B->requests[0].second]==NOT_PUSHED;) 
+            B->requests.pop_front();
+        if(!B->requests.empty()){
+            deque<pair<int,int>>::iterator acc = B->requests.begin();
+            int du = abs(acc->first-my_stage);
+            for(int i=1; i<B->requests.size();++i){
+                auto it = B->requests.begin()+i;
+                if (B->stages[B->requests[i].first].bottom[B->requests[i].second]==NOT_PUSHED) {B->requests.erase(it); --i; continue;}
+                int dl = abs(it->first-my_stage);
+                if(dl<du) acc = it; else if (dl>du) continue;
+                    else if (acc->second == DOWN) acc = it;
             }
-            if (B->stages[acc->first].bottom[acc->second] == NOT_PUSHED) {B->requests.erase(*acc); continue;} 
             task = acc->first; updown = acc->second;
-            B->requests.erase(*acc);
+            B->requests.erase(acc);
             #ifdef DEBUG
             printf("%d\tI'm lift %d ::run() I'm on %d and I found new task, %d\n", B->World_time, number, my_stage, task);
             #endif
-            break;
         }
         if (task == 0) {
             #ifdef DEBUG
@@ -475,5 +497,6 @@ int main(){
     //printf(Color_CYAN);
     Building B; B.reader.filename = string("input.txt");
     B.run();
+    B.print_stats();
     return 0;
 }
